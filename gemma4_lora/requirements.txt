@@ -1,0 +1,8 @@
+torch
+torchvision
+transformers>=5.5.0
+accelerate
+peft
+datasets
+huggingface_hub
+safetensors

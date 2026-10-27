@@ -1,0 +1,1 @@
+-r ../gemma4_lora/requirements.txt
