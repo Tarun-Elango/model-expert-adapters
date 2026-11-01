@@ -7,6 +7,7 @@ import torch
 from torch.utils.data import Dataset
 from peft import LoraConfig, get_peft_model
 from transformers import Trainer, TrainingArguments
+from transformers.trainer_utils import get_last_checkpoint
 
 from model.base_model import load_base_model
 
@@ -27,6 +28,12 @@ class Examples(Dataset):
                 full = processor.apply_chat_template(
                     conversation, tokenize=True, add_generation_prompt=False, enable_thinking=False
                 )
+                # Multimodal processors return a batch even for one conversation.
+                # Tokenizers may instead return the single token sequence directly.
+                if prefix and isinstance(prefix[0], list):
+                    prefix = prefix[0]
+                if full and isinstance(full[0], list):
+                    full = full[0]
                 if full[:len(prefix)] != prefix:
                     raise ValueError("Chat template prompt is not a prefix of the completed conversation")
                 full = full[:max_length]
@@ -62,14 +69,36 @@ def main(use_dora=False, project_root=ROOT):
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
+    parser.add_argument("--save-steps", type=int, default=25,
+                        help="Save a checkpoint every N optimizer steps (default: 25)")
+    parser.add_argument("--resume-from-checkpoint", nargs="?", const="latest",
+                        help="Resume from the latest checkpoint, or provide a checkpoint directory")
     args = parser.parse_args()
+    if args.save_steps < 1:
+        parser.error("--save-steps must be a positive integer")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for training. Install a CUDA-enabled PyTorch build and run on a machine with an NVIDIA GPU and driver.")
     data_path = ROOT.parent / "shared" / "data" / f"{args.expert}.jsonl"
     if not data_path.is_file():
         raise FileNotFoundError(f"Run python prepare_data.py {args.expert} first")
     output = project_root / "adapters" / args.expert
-    if output.exists():
+    resume_checkpoint = None
+    if args.resume_from_checkpoint:
+        if args.resume_from_checkpoint == "latest":
+            resume_checkpoint = get_last_checkpoint(str(output)) if output.is_dir() else None
+            if resume_checkpoint is None:
+                raise FileNotFoundError(f"No checkpoint found in {output}")
+        else:
+            resume_checkpoint = str(Path(args.resume_from_checkpoint).resolve())
+            if not (Path(resume_checkpoint) / "trainer_state.json").is_file():
+                raise FileNotFoundError(f"No trainer_state.json in checkpoint {resume_checkpoint}")
+        print(f"Resuming from checkpoint: {resume_checkpoint}", flush=True)
+    elif output.exists():
         raise FileExistsError(f"{output} already exists; move it aside before training again")
-    processor, base = load_base_model()
+    # Keep the entire model on one GPU; automatic inference offloading is not
+    # suitable for training. An out-of-memory error means a larger GPU or a
+    # different training configuration is needed.
+    processor, base = load_base_model(device_map={"": torch.cuda.current_device()})
     data = Examples(data_path, processor, args.max_length)
     # Use fully qualified module names to avoid modifying vision/audio towers.
     targets = [name for name, module in base.named_modules()
@@ -91,12 +120,13 @@ def main(use_dora=False, project_root=ROOT):
         output_dir=str(output), num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation,
-        learning_rate=args.learning_rate, logging_steps=10, save_strategy="no",
+        learning_rate=args.learning_rate, logging_steps=10, save_strategy="steps",
+        save_steps=args.save_steps, save_total_limit=2,
         report_to="none", remove_unused_columns=False,
     )
     trainer = Trainer(model=model, args=options, train_dataset=data,
                       data_collator=collator(processor.tokenizer.pad_token_id))
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
     model.save_pretrained(output, safe_serialization=True)
     print(f"Saved {args.expert} adapter to {output}")
 

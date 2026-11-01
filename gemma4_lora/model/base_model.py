@@ -15,7 +15,7 @@ def download_model():
     print(f"Model available at {MODEL_DIR}")
 
 
-def load_base_model():
+def load_base_model(device_map="auto"):
     """Return the same processor/model pair on subsequent calls in this process."""
     global _loaded
     if _loaded is None:
@@ -23,7 +23,7 @@ def load_base_model():
             raise FileNotFoundError("Model not downloaded. Run python model/base_model.py first.")
         processor = AutoProcessor.from_pretrained(MODEL_DIR, local_files_only=True)
         model = AutoModelForMultimodalLM.from_pretrained(
-            MODEL_DIR, local_files_only=True, dtype="auto", device_map="auto"
+            MODEL_DIR, local_files_only=True, dtype="auto", device_map=device_map
         )
         for parameter in model.parameters():
             parameter.requires_grad_(False)
